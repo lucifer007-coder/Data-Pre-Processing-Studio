@@ -117,6 +117,9 @@ streamlit run app.py
 The app will run locally at:
 👉 [http://localhost:8501](http://localhost:8501)
 
+You can try the app here:
+👉 [https://data-pre-processing-studio.streamlit.app/](https://data-pre-processing-studio.streamlit.app/)
+
 ---
 
 ## 📊 Example Workflow
