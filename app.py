@@ -1,20 +1,15 @@
-# Streamlit Data Preprocessing Studio
+# app.py
+# Streamlit Data Preprocessing Studio — Hardened & Fixed Version
 
-# Description:
-# A complete Streamlit application to upload CSVs and perform common data preprocessing tasks
-# with an intuitive, pipeline-based UI and rich previews/dashboards.
-
-# =========================
-# Imports
-# =========================
 import io
+import os
 import time
 from typing import List, Dict, Any, Tuple, Optional
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, LabelEncoder
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import altair as alt
 
 # =========================
@@ -27,79 +22,102 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Seed for deterministic sampling
-RANDOM_STATE = 42
-PREVIEW_ROWS = 500  # sample rows for previews to keep UI snappy
-
+# =========================
+# Constants & Defaults
+# =========================
+DEFAULT_RANDOM_STATE = 42
+DEFAULT_PREVIEW_ROWS = int(os.getenv("DPS_PREVIEW_ROWS", "500"))
+DEFAULT_MAX_UPLOAD_MB = int(os.getenv("DPS_MAX_UPLOAD_MB", "200"))
 
 # =========================
-# Session State Bootstrap
+# Session State
 # =========================
 def init_session():
-    if "raw_df" not in st.session_state:
-        st.session_state.raw_df = None  # the first loaded DataFrame
-    if "df" not in st.session_state:
-        st.session_state.df = None  # the working DataFrame
-    if "history" not in st.session_state:
-        st.session_state.history = []  # stack of (label, df_snapshot)
-    if "pipeline" not in st.session_state:
-        st.session_state.pipeline = []  # list of step dicts
-    if "changelog" not in st.session_state:
-        st.session_state.changelog = []  # user-readable messages
-    if "last_preview" not in st.session_state:
-        st.session_state.last_preview = None  # cache preview results (df, summary)
-
+    ss = st.session_state
+    ss.setdefault("dps_raw_df", None)
+    ss.setdefault("dps_df", None)
+    ss.setdefault("dps_history", [])  # stores tuples (label, df_snapshot)
+    ss.setdefault("dps_pipeline", [])
+    ss.setdefault("dps_changelog", [])
+    ss.setdefault("dps_last_preview", None)  # (df, message)
+    ss.setdefault("dps_preview_df", None)
+    ss.setdefault("dps_settings", {
+        "preview_rows": DEFAULT_PREVIEW_ROWS,
+        "max_upload_mb": DEFAULT_MAX_UPLOAD_MB,
+        "random_state": DEFAULT_RANDOM_STATE,
+        "atomic_apply": True,
+        "low_memory_mode": True,
+    })
 
 init_session()
 
+def S(key: str):
+    return st.session_state[key]
+
+def setS(key: str, value):
+    st.session_state[key] = value
 
 # =========================
 # Utility Helpers
 # =========================
-def sample_for_preview(df: pd.DataFrame, n: int = PREVIEW_ROWS) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    if len(df) <= n:
-        return df.copy()
-    return df.sample(n=n, random_state=RANDOM_STATE).copy()
-
+def update_preview_sample():
+    """Update `dps_preview_df` from `dps_df` using sampling controlled by settings."""
+    df = S("dps_df")
+    if df is None or getattr(df, "empty", True):
+        # Keep preview None to indicate no preview available
+        setS("dps_preview_df", None)
+        return
+    n = max(1, int(S("dps_settings")["preview_rows"]))
+    rs = int(S("dps_settings")["random_state"])
+    # Use min(len(df), n) to avoid sampling errors
+    setS("dps_preview_df", df.sample(n=min(len(df), n), random_state=rs).copy())
 
 def push_history(label: str):
-    """Save a snapshot for undo, with a helpful label."""
-    if st.session_state.df is not None:
-        st.session_state.history.append((label, st.session_state.df.copy()))
-
+    """Push a snapshot of the current dataset to history (capped)."""
+    cur = S("dps_df")
+    if cur is not None:
+        hist = S("dps_history")
+        # store a shallow copy (DataFrame.copy()) to freeze the state
+        hist.append((label, cur.copy()))
+        # Avoid memory blowup by keeping only last 10 snapshots
+        if len(hist) > 10:
+            hist.pop(0)
+        setS("dps_history", hist)
 
 def undo_last():
-    """Undo the last applied step by restoring the previous snapshot."""
-    if st.session_state.history:
-        label, df_prev = st.session_state.history.pop()
-        st.session_state.df = df_prev
-        st.session_state.changelog.append(f"↩️ Undo: {label}")
+    """Undo to the last snapshot in history."""
+    hist = S("dps_history")
+    if hist:
+        label, df_prev = hist.pop()
+        setS("dps_df", df_prev)
+        update_preview_sample()
+        S("dps_changelog").append(f"↩️ Undo: {label}")
         st.success(f"Undid: {label}")
     else:
         st.info("History is empty. Nothing to undo.")
 
-
 def reset_all():
-    """Clear everything and start fresh."""
-    st.session_state.raw_df = None
-    st.session_state.df = None
-    st.session_state.history = []
-    st.session_state.pipeline = []
-    st.session_state.changelog = []
-    st.session_state.last_preview = None
-
+    setS("dps_raw_df", None)
+    setS("dps_df", None)
+    setS("dps_history", [])
+    setS("dps_pipeline", [])
+    setS("dps_changelog", [])
+    setS("dps_last_preview", None)
+    setS("dps_preview_df", None)
 
 def dtype_split(df: pd.DataFrame) -> Tuple[List[str], List[str]]:
+    """Return numeric and categorical column lists for a DataFrame."""
+    if df is None:
+        return [], []
     num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     cat_cols = [c for c in df.columns if c not in num_cols]
     return num_cols, cat_cols
 
-
 def compute_basic_stats(df: pd.DataFrame) -> Dict[str, Any]:
-    if df is None:
-        return {}
+    """Compute a small set of basic statistics for dashboarding."""
+    if df is None or df.empty:
+        return {"shape": (0, 0), "columns": [], "dtypes": {}, "missing_total": 0,
+                "missing_by_col": {}, "numeric_cols": [], "categorical_cols": [], "describe_numeric": {}}
     num_cols, cat_cols = dtype_split(df)
     stats = {
         "shape": df.shape,
@@ -113,7 +131,6 @@ def compute_basic_stats(df: pd.DataFrame) -> Dict[str, Any]:
     }
     return stats
 
-
 def compare_stats(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "shape_before": before.get("shape"),
@@ -124,11 +141,16 @@ def compare_stats(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, An
         "n_columns_after": len(after.get("columns", [])),
     }
 
-
-def alt_histogram(df: pd.DataFrame, column: str, title: str):
-    # Build an Altair histogram with automatic binning
+def safe_alt_histogram(df: pd.DataFrame, column: str, title: str):
+    """Create an Altair histogram safely with checks."""
+    if df is None or df.empty or column not in df.columns:
+        st.info("No data available for histogram.")
+        return
+    if not pd.api.types.is_numeric_dtype(df[column]):
+        st.info(f"Column '{column}' is not numeric.")
+        return
     chart = (
-        alt.Chart(df)
+        alt.Chart(df.dropna(subset=[column]))
         .mark_bar()
         .encode(
             x=alt.X(f"{column}:Q", bin=alt.Bin(maxbins=40), title=column),
@@ -138,49 +160,59 @@ def alt_histogram(df: pd.DataFrame, column: str, title: str):
         .properties(height=250, title=title)
         .interactive()
     )
-    return chart
-
+    st.altair_chart(chart, use_container_width=True)
 
 # =========================
-# Preprocessing Step Helpers
+# Preprocessing Step Helpers (robust)
 # =========================
+
 # 1) Missing Data
 def impute_missing(
     df: pd.DataFrame,
-    columns: List[str],
+    columns: Optional[List[str]] = None,
     strategy: str = "mean",
     constant_value: Optional[Any] = None,
 ) -> Tuple[pd.DataFrame, str]:
+    """Impute missing values with simple strategies. Works on numeric and categorical where applicable."""
+    if df is None:
+        return None, "No data provided."
     df = df.copy()
-    if not columns:
+    if columns is None or len(columns) == 0:
         columns = df.columns.tolist()
 
-    num_cols, cat_cols = dtype_split(df)
+    # sanitize constant_value (best-effort cast)
+    if strategy == "constant":
+        cv = constant_value
+        if isinstance(cv, str):
+            s = cv.strip()
+            try:
+                cv = float(s) if "." in s else int(s)
+            except Exception:
+                cv = s  # keep as string
+        constant_value = cv
 
+    num_cols, _ = dtype_split(df)
+    applied_cols = []
     if strategy in ("mean", "median"):
         target_cols = [c for c in columns if c in num_cols]
         for c in target_cols:
+            # numeric mean/median ignores non-numeric-like entries via pandas coercion if any
             val = df[c].mean() if strategy == "mean" else df[c].median()
             df[c] = df[c].fillna(val)
-        msg = f"Imputed {len(target_cols)} numeric columns using {strategy}."
+        applied_cols = target_cols
     elif strategy == "mode":
-        target_cols = columns
+        target_cols = [c for c in columns if c in df.columns]
         for c in target_cols:
-            try:
-                mode = df[c].mode(dropna=True)
-                if not mode.empty:
-                    df[c] = df[c].fillna(mode.iloc[0])
-            except Exception:
-                pass
-        msg = f"Imputed {len(target_cols)} columns using mode."
+            mode = df[c].mode(dropna=True)
+            if not mode.empty:
+                df[c] = df[c].fillna(mode.iloc[0])
+        applied_cols = target_cols
     elif strategy == "constant":
-        val = constant_value if constant_value is not None else 0
-        df[columns] = df[columns].fillna(val)
-        msg = f"Imputed {len(columns)} columns with constant value {val}."
-    else:
-        msg = "No imputation performed (unknown strategy)."
+        target_cols = [c for c in columns if c in df.columns]
+        df[target_cols] = df[target_cols].fillna(constant_value)
+        applied_cols = target_cols
+    msg = f"Imputation strategy '{strategy}' applied to columns: {applied_cols}."
     return df, msg
-
 
 def drop_missing(
     df: pd.DataFrame,
@@ -188,18 +220,18 @@ def drop_missing(
     threshold: Optional[float] = None,
     columns: Optional[List[str]] = None,
 ) -> Tuple[pd.DataFrame, str]:
-    """
-    axis: 'rows' or 'columns'
-    threshold: if provided for rows => drop rows with missing ratio >= threshold (0-1)
-               if provided for columns => drop columns with missing ratio >= threshold
-    columns: if provided with rows, drop rows that are NA in ANY of these columns.
-    """
+    """Drop rows or columns based on missingness rules."""
+    if df is None:
+        return None, "No data provided."
     df = df.copy()
+    if df.empty:
+        return df, "Dataset is empty; nothing to drop."
     if axis == "rows":
         initial = len(df)
         if columns:
-            df = df.dropna(subset=columns)
-            msg = f"Dropped rows with missing in selected columns {columns}. Removed {initial - len(df)} rows."
+            cols = [c for c in columns if c in df.columns]
+            df = df.dropna(subset=cols)
+            msg = f"Dropped rows missing any of columns {cols}. Removed {initial - len(df)} rows."
         elif threshold is not None:
             row_missing_ratio = df.isna().mean(axis=1)
             df = df.loc[row_missing_ratio < threshold]
@@ -207,7 +239,7 @@ def drop_missing(
         else:
             df = df.dropna()
             msg = f"Dropped rows with any missing values. Removed {initial - len(df)} rows."
-    else:
+    else:  # columns
         initial = len(df.columns)
         if threshold is not None:
             col_missing_ratio = df.isna().mean(axis=0)
@@ -215,12 +247,12 @@ def drop_missing(
             df = df.drop(columns=to_drop)
             msg = f"Dropped columns with missing ratio ≥ {threshold:.2f}: {to_drop}"
         else:
-            # Drop columns that contain ANY missing values
             to_drop = [c for c in df.columns if df[c].isna().any()]
             df = df.drop(columns=to_drop)
             msg = f"Dropped columns containing any missing values: {to_drop}"
+    if df.empty:
+        msg += " Resulting dataset is empty."
     return df, msg
-
 
 # 2) Data Inconsistency
 def normalize_text(
@@ -230,77 +262,104 @@ def normalize_text(
     trim: bool = True,
     collapse_spaces: bool = True,
 ) -> Tuple[pd.DataFrame, str]:
+    if df is None:
+        return None, "No data provided."
     df = df.copy()
+    applied = []
+    skipped = []
     for c in columns:
-        if c in df.columns:
-            df[c] = df[c].astype(str)
-            if trim:
-                df[c] = df[c].str.strip()
-            if lowercase:
-                df[c] = df[c].str.lower()
-            if collapse_spaces:
-                df[c] = df[c].str.replace(r"\s+", " ", regex=True)
-    return df, f"Normalized text for columns: {columns}"
-
-
-def standardize_dates(
-    df: pd.DataFrame, columns: List[str], output_format: str = "%Y-%m-%d"
-) -> Tuple[pd.DataFrame, str]:
-    df = df.copy()
-    for c in columns:
-        try:
-            dt = pd.to_datetime(df[c], errors="coerce", infer_datetime_format=True)
-            df[c] = dt.dt.strftime(output_format)
-        except Exception:
-            pass
-    return df, f"Standardized date format to {output_format} for columns: {columns}"
-
-
-def unit_convert(
-    df: pd.DataFrame, column: str, factor: float, new_name: Optional[str] = None
-) -> Tuple[pd.DataFrame, str]:
-    df = df.copy()
-    if column not in df.columns:
-        return df, f"Column {column} not found for unit conversion."
-    if not pd.api.types.is_numeric_dtype(df[column]):
-        return df, f"Column {column} is not numeric; skipped unit conversion."
-    target = new_name if new_name else column
-    df[target] = df[column] * factor
-    if new_name:
-        msg = f"Created '{new_name}' by converting '{column}' with factor {factor}."
-    else:
-        msg = f"Converted '{column}' in place with factor {factor}."
+        if c not in df.columns:
+            skipped.append(c)
+            continue
+        # operate only on object/string-like cols
+        if not (pd.api.types.is_object_dtype(df[c]) or pd.api.types.is_string_dtype(df[c])):
+            skipped.append(c)
+            continue
+        s = df[c].astype("string")
+        if trim:
+            s = s.str.strip()
+        if lowercase:
+            s = s.str.lower()
+        if collapse_spaces:
+            s = s.str.replace(r"\s+", " ", regex=True)
+        df[c] = s
+        applied.append(c)
+    msg = f"Normalized text for columns: {applied}. Skipped: {skipped}."
     return df, msg
 
+def standardize_dates(df: pd.DataFrame, columns: List[str], output_format: str = "%Y-%m-%d"):
+    """Parse and format date-like columns. Missing/invalid dates preserved as pd.NA."""
+    if df is None:
+        return None, "No data provided."
+    df = df.copy()
+    report = []
+    for c in columns:
+        if c not in df.columns:
+            report.append(f"{c}: not found")
+            continue
+        parsed = pd.to_datetime(df[c], errors="coerce")
+        n = len(df)
+        failed = int(parsed.isna().sum())
+        # Format only non-missing parsed values, preserve NA for missing
+        formatted = parsed.dt.strftime(output_format)
+        formatted = formatted.where(parsed.notna(), other=pd.NA)
+        # set to string dtype to keep consistency
+        df[c] = formatted.astype("string")
+        report.append(f"{c}: parsed {n - failed}/{n}, failed {failed}")
+    return df, "Standardized dates. " + "; ".join(report)
+
+def unit_convert(df: pd.DataFrame, column: Optional[str] = None, factor: float = 1.0, new_name: Optional[str] = None):
+    if df is None:
+        return None, "No data provided."
+    df = df.copy()
+    if not column or column not in df.columns:
+        return df, f"Column '{column}' not found for unit conversion."
+    numeric = pd.to_numeric(df[column], errors="coerce")
+    finite_mask = np.isfinite(numeric)
+    out = df[column].copy()
+    # Use pandas Series assignment with mask to avoid SettingWithCopyWarning
+    out = out.astype("object")  # temporarily allow mixed types
+    out_loc = out[finite_mask].copy()
+    out_loc = (numeric.loc[finite_mask] * factor).astype(float)
+    out.loc[finite_mask] = out_loc
+    if new_name:
+        df[new_name] = out
+        msg = f"Created '{new_name}' from '{column}' (factor={factor}). Non-finite left: {(~finite_mask).sum()}."
+    else:
+        df[column] = out
+        msg = f"Converted '{column}' in place (factor={factor}). Non-finite left: {(~finite_mask).sum()}."
+    return df, msg
 
 # 3 & 7) Outliers / Noisy Data
 def detect_outliers_mask(
     df: pd.DataFrame, columns: List[str], method: str = "IQR", z_thresh: float = 3.0, iqr_k: float = 1.5
 ) -> pd.Series:
-    """Return boolean mask where True indicates outlier row (across any selected column)."""
+    if df is None or df.empty or not columns:
+        return pd.Series(dtype=bool, index=df.index if df is not None else pd.Index([]))
     mask = pd.Series(False, index=df.index)
     for c in columns:
-        if not pd.api.types.is_numeric_dtype(df[c]):
+        if c not in df.columns or not pd.api.types.is_numeric_dtype(df[c]):
             continue
-        x = df[c]
+        x = df[c].dropna()
+        if x.empty:
+            continue
         if method == "IQR":
             q1 = x.quantile(0.25)
             q3 = x.quantile(0.75)
             iqr = q3 - q1
             lower = q1 - iqr_k * iqr
             upper = q3 + iqr_k * iqr
-            mask_c = (x < lower) | (x > upper)
+            mask_c = (df[c] < lower) | (df[c] > upper)
         else:  # Z-score
             mu = x.mean()
             sigma = x.std(ddof=0)
             if sigma == 0 or np.isnan(sigma):
-                mask_c = pd.Series(False, index=x.index)
+                mask_c = pd.Series(False, index=df.index)
             else:
-                z = (x - mu) / sigma
+                z = (df[c] - mu) / sigma
                 mask_c = z.abs() > z_thresh
         mask = mask | mask_c
     return mask
-
 
 def handle_outliers(
     df: pd.DataFrame,
@@ -310,144 +369,210 @@ def handle_outliers(
     z_thresh: float = 3.0,
     iqr_k: float = 1.5,
 ) -> Tuple[pd.DataFrame, str]:
+    if df is None:
+        return None, "No data provided."
     df = df.copy()
     if not columns:
         return df, "No columns selected for outlier handling."
+    valid_cols = [c for c in columns if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
+    if not valid_cols:
+        return df, "No numeric columns available for outlier handling."
 
     if method == "remove":
-        mask = detect_outliers_mask(df, columns, detect_method, z_thresh, iqr_k)
+        mask = detect_outliers_mask(df, valid_cols, detect_method, z_thresh, iqr_k)
         removed = int(mask.sum())
         df = df.loc[~mask]
-        msg = f"Removed {removed} outlier rows using {detect_method} on {columns}."
+        msg = f"Removed {removed} outlier rows using {detect_method} on {valid_cols}."
     elif method == "cap":
-        for c in columns:
-            if not pd.api.types.is_numeric_dtype(df[c]):
+        for c in valid_cols:
+            # operate using non-na subset to compute thresholds
+            series = df[c].dropna()
+            if series.empty:
                 continue
             if detect_method == "IQR":
-                q1 = df[c].quantile(0.25)
-                q3 = df[c].quantile(0.75)
+                q1 = series.quantile(0.25)
+                q3 = series.quantile(0.75)
                 iqr = q3 - q1
                 lower = q1 - iqr_k * iqr
                 upper = q3 + iqr_k * iqr
             else:
-                mu = df[c].mean()
-                sigma = df[c].std(ddof=0)
+                mu = series.mean()
+                sigma = series.std(ddof=0)
                 if sigma == 0 or np.isnan(sigma):
                     continue
                 lower = mu - z_thresh * sigma
                 upper = mu + z_thresh * sigma
             df[c] = df[c].clip(lower=lower, upper=upper)
-        msg = f"Capped outliers using {detect_method} thresholds in columns: {columns}."
+        msg = f"Capped outliers using {detect_method} thresholds in columns: {valid_cols}."
     else:  # 'log1p'
-        for c in columns:
-            if pd.api.types.is_numeric_dtype(df[c]):
-                # shift if negative values present
-                min_val = df[c].min()
-                shift = 1 - min_val if min_val <= 0 else 0
-                df[c] = np.log1p(df[c] + shift)
-        msg = f"Applied log1p transform to columns: {columns}."
+        for c in valid_cols:
+            series = pd.to_numeric(df[c], errors="coerce")
+            if series.empty:
+                continue
+            min_val = series.min(skipna=True)
+            shift = 1 - min_val if min_val <= 0 else 0
+            # add shift only to finite entries
+            finite_mask = np.isfinite(series)
+            transformed = series.copy()
+            transformed.loc[finite_mask] = np.log1p(series.loc[finite_mask] + shift)
+            df[c] = transformed
+        msg = f"Applied log1p transform to columns: {valid_cols}."
+    if df.empty:
+        msg += " Resulting dataset is empty."
     return df, msg
 
-
 # 4) Duplicates
-def remove_duplicates(df: pd.DataFrame, subset: Optional[List[str]], keep: str = "first") -> Tuple[pd.DataFrame, str]:
+def remove_duplicates(df: pd.DataFrame, subset: Optional[List[str]], keep) -> Tuple[pd.DataFrame, str]:
+    if df is None:
+        return None, "No data provided."
     df = df.copy()
     initial = len(df)
+    if subset:
+        subset = [c for c in subset if c in df.columns]
+    # pandas accepts keep in {"first", "last", False}
     df = df.drop_duplicates(subset=subset if subset else None, keep=keep)
     removed = initial - len(df)
     msg = f"Removed {removed} duplicate rows (keep={keep}) using columns: {subset if subset else 'ALL'}."
+    if df.empty:
+        msg += " Resulting dataset is empty."
     return df, msg
-
 
 # 5) Categorical Encoding
-def encode_categorical(
-    df: pd.DataFrame, columns: List[str], method: str = "onehot"
-) -> Tuple[pd.DataFrame, str]:
+def encode_categorical(df: pd.DataFrame, columns: List[str], method: str = "onehot") -> Tuple[pd.DataFrame, str]:
+    if df is None:
+        return None, "No data provided."
     df = df.copy()
+    cols = [c for c in columns if c in df.columns]
+    if not cols:
+        return df, "No valid columns selected for encoding."
+
     if method == "onehot":
         before_cols = set(df.columns)
-        df = pd.get_dummies(df, columns=columns, drop_first=False, dummy_na=False)
+        # Keep dummy_na=False (explicit). If user needs NA indicator, consider adding option.
+        df = pd.get_dummies(df, columns=cols, drop_first=False, dummy_na=False)
         added = list(set(df.columns) - before_cols)
-        msg = f"One-hot encoded {len(columns)} columns. New columns: {len(added)}."
-    else:  # label
-        le_info = []
-        for c in columns:
-            if c in df.columns:
-                le = LabelEncoder()
-                df[c] = df[c].astype(str).fillna("NaN")
-                df[c] = le.fit_transform(df[c])
-                le_info.append(c)
-        msg = f"Label encoded columns: {le_info}"
+        msg = f"One-hot encoded {len(cols)} columns. Added {len(added)} new columns."
+    else:  # 'label'
+        applied = []
+        # Use pd.Categorical for stable, pandas-version-robust encoding
+        for c in cols:
+            # Convert to categorical; codes: -1 -> NA
+            cat = pd.Categorical(df[c], ordered=False)
+            codes = pd.Series(cat.codes, index=df.index)
+            # map -1 -> pd.NA to preserve missing values; use nullable Int dtype
+            codes = codes.where(codes != -1, other=pd.NA).astype("Int64")
+            df[c] = codes
+            applied.append(c)
+        msg = f"Label-encoded columns (nullable Int64): {applied}."
     return df, msg
 
-
 # 6) Scaling / Normalization
-def scale_features(df: pd.DataFrame, columns: List[str], method: str = "standard") -> Tuple[pd.DataFrame, str]:
+def scale_features(df: pd.DataFrame, columns: List[str], method: str = "standard"):
+    if df is None:
+        return None, "No data provided."
+    if getattr(df, "empty", True):
+        return df.copy(), "Dataset is empty; nothing scaled."
     df = df.copy()
     cols = [c for c in columns if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
     if not cols:
         return df, "No numeric columns selected for scaling."
     scaler = StandardScaler() if method == "standard" else MinMaxScaler()
-    df[cols] = scaler.fit_transform(df[cols].values)
-    msg = f"Applied {'StandardScaler' if method == 'standard' else 'MinMaxScaler'} to columns: {cols}."
-    return df, msg
-
+    # Build a small DataFrame for scaling to maintain column names and index alignment
+    data_to_scale = df[cols].astype(float)
+    scaled = scaler.fit_transform(data_to_scale)
+    scaled_df = pd.DataFrame(scaled, index=df.index, columns=cols)
+    df[cols] = scaled_df
+    return df, f"Applied {scaler.__class__.__name__} to: {cols}."
 
 # 8) Imbalanced Data (basic random over/under sampling)
 def rebalance_dataset(
-    df: pd.DataFrame, target: str, method: str = "oversample", ratio: float = 1.0, random_state: int = RANDOM_STATE
+    df: pd.DataFrame,
+    target: str,
+    method: str = "oversample",
+    ratio: float = 1.0,
+    random_state: Optional[int] = None
 ) -> Tuple[pd.DataFrame, str]:
     """
-    method:
-      - 'oversample': upsample minority classes to match (ratio * majority count)
-      - 'undersample': downsample majority classes to match (ratio * minority count)
-    ratio:
-      - scaling against the opposite side; e.g., oversample minority to (ratio * max_class_count)
+    Basic oversampling / undersampling for imbalanced classification datasets.
+
+    Updated to correctly handle NaN target class and stable sampling.
     """
+    if df is None:
+        return None, "No data provided."
     if target not in df.columns:
         return df, f"Target column '{target}' not found."
+    if df.empty:
+        return df.copy(), "Dataset is empty; skipping rebalancing."
 
     df = df.copy()
+    rs = S("dps_settings")["random_state"] if random_state is None else random_state
     counts = df[target].value_counts(dropna=False)
+
     if counts.empty or len(counts) <= 1:
         return df, "Target column has only one class or is empty; skipping rebalancing."
 
+    # Helper to get subset for a class, including NaN
+    def get_subset_for_class(cls_val):
+        if pd.isna(cls_val):
+            return df[df[target].isna()]
+        return df[df[target] == cls_val]
+
     if method == "oversample":
         majority_count = counts.max()
-        desired = int(round(majority_count * ratio))
+        desired = max(1, int(round(majority_count * ratio)))
         dfs = []
-        for cls, cnt in counts.items():
-            subset = df[df[target] == cls]
+        for cls in counts.index:
+            cnt = int(counts.loc[cls])
+            subset = get_subset_for_class(cls)
+            if subset.empty:
+                # nothing to add; keep as-is
+                dfs.append(subset)
+                continue
             if cnt < desired:
                 to_add = desired - cnt
-                add = subset.sample(n=to_add, replace=True, random_state=random_state)
+                # allow replacement sampling
+                add = subset.sample(n=to_add, replace=True, random_state=rs)
                 dfs.append(pd.concat([subset, add], axis=0))
             else:
                 dfs.append(subset)
-        df_bal = pd.concat(dfs, axis=0).sample(frac=1.0, random_state=random_state).reset_index(drop=True)
+        df_bal = pd.concat(dfs, axis=0).sample(frac=1.0, random_state=rs).reset_index(drop=True)
         msg = f"Oversampled minority classes to ~{desired} rows each (ratio={ratio})."
+
     else:  # undersample
         minority_count = counts.min()
-        desired = int(round(minority_count * ratio))
+        desired = max(1, int(round(minority_count * ratio)))
         dfs = []
-        for cls, cnt in counts.items():
-            subset = df[df[target] == cls]
+        for cls in counts.index:
+            cnt = int(counts.loc[cls])
+            subset = get_subset_for_class(cls)
+            if subset.empty:
+                dfs.append(subset)
+                continue
             if cnt > desired:
-                dfs.append(subset.sample(n=desired, replace=False, random_state=random_state))
+                # sample without replacement
+                dfs.append(subset.sample(n=desired, replace=False, random_state=rs))
             else:
                 dfs.append(subset)
-        df_bal = pd.concat(dfs, axis=0).sample(frac=1.0, random_state=random_state).reset_index(drop_index=True)
+        df_bal = pd.concat(dfs, axis=0).sample(frac=1.0, random_state=rs).reset_index(drop=True)
         msg = f"Undersampled majority classes to ~{desired} rows each (ratio={ratio})."
 
+    if df_bal.empty:
+        msg += " Resulting dataset is empty."
     return df_bal, msg
-
 
 # =========================
 # Pipeline Runner
 # =========================
 def apply_step(df: pd.DataFrame, step: Dict[str, Any]) -> Tuple[pd.DataFrame, str]:
+    """Dispatch a single step with defensive parameter handling."""
     kind = step.get("kind")
-    params = step.get("params", {})
+    params = step.get("params", {}) or {}
+
+    # small naming harmonization: accept 'column' or 'columns' for unit_convert
+    if kind == "unit_convert" and "columns" in params and "column" not in params:
+        cols = params.get("columns") or []
+        params["column"] = cols[0] if cols else None
+
     if kind == "impute":
         return impute_missing(df, **params)
     if kind == "drop_missing":
@@ -470,22 +595,32 @@ def apply_step(df: pd.DataFrame, step: Dict[str, Any]) -> Tuple[pd.DataFrame, st
         return rebalance_dataset(df, **params)
     return df, f"Unknown step kind: {kind}"
 
-
-def run_pipeline(df: pd.DataFrame, pipeline: List[Dict[str, Any]]) -> Tuple[pd.DataFrame, List[str]]:
-    msgs = []
+def run_pipeline(df, pipeline, atomic=True):
+    """Run pipeline defensively and return (result_df, messages, error_or_None)."""
+    if df is None:
+        return None, ["No data provided to run pipeline."], "No data"
+    msgs, working = [], df.copy()
     for idx, step in enumerate(pipeline, start=1):
-        df, msg = apply_step(df, step)
-        msgs.append(f"{idx}. {msg}")
-    return df, msgs
-
+        try:
+            t0 = time.perf_counter()
+            working, msg = apply_step(working, step)
+            msgs.append(f"{idx}. {msg} (took {time.perf_counter() - t0:.3f}s)")
+            if working is None:
+                raise RuntimeError("Step returned None dataframe.")
+        except Exception as e:
+            err = f"Step {idx} '{step.get('kind')}' failed: {e}"
+            if atomic:
+                return df, msgs, err
+            msgs.append(f"❌ {err} — continuing.")
+    return working, msgs, None
 
 # =========================
-# UI: Sidebar - Navigation & Controls
+# UI: Sidebar - Navigation & Settings
 # =========================
-def sidebar_navigation():
+def sidebar_navigation_and_settings():
     st.sidebar.title("🧭 Navigation")
     section = st.sidebar.radio(
-        "Go to section",
+        "Go to",
         [
             "Upload",
             "Missing Data",
@@ -498,18 +633,29 @@ def sidebar_navigation():
             "Pipeline & Preview",
             "Dashboard & Download",
         ],
-        help="Choose what you want to work on.",
     )
     st.sidebar.markdown("---")
-    if st.sidebar.button("🔄 Reset All", help="Clear dataset, pipeline, and history."):
-        reset_all()
-        st.experimental_rerun()
-    if st.sidebar.button("↩️ Undo Last", help="Undo the last applied step."):
-        undo_last()
-    st.sidebar.markdown("---")
-    st.sidebar.caption("Tip: Use 'Add to Pipeline' on each section, then run them together.")
-    return section
+    colA, colB = st.sidebar.columns(2)
+    with colA:
+        if st.sidebar.button("↩️ Undo Last"):
+            undo_last()
+    with colB:
+        if st.sidebar.button("🔄 Reset All"):
+            reset_all()
+            st.rerun()
 
+    with st.sidebar.expander("⚙️ Settings", expanded=False):
+        settings = S("dps_settings")
+        # bounds tightened and coerced to ints where appropriate
+        settings["preview_rows"] = int(st.number_input("Preview sample rows", min_value=10, max_value=50000, value=int(settings["preview_rows"]), step=50))
+        settings["max_upload_mb"] = int(st.number_input("Max upload size (MB)", min_value=1, max_value=10000, value=int(settings["max_upload_mb"]), step=10))
+        settings["random_state"] = int(st.number_input("Random seed", min_value=0, max_value=10_000, value=int(settings["random_state"]), step=1))
+        settings["atomic_apply"] = st.checkbox("Atomic pipeline (rollback on error)", value=bool(settings["atomic_apply"]))
+        settings["low_memory_mode"] = st.checkbox("Low-memory previews (use sampling)", value=bool(settings["low_memory_mode"]))
+        setS("dps_settings", settings)
+
+    st.sidebar.caption("Tip: Add steps to the pipeline from each section, then apply them in batch.")
+    return section
 
 # =========================
 # UI Sections
@@ -517,94 +663,107 @@ def sidebar_navigation():
 def section_upload():
     st.title("🧹 Data Preprocessing Studio")
     st.caption("Upload a CSV, chain preprocessing steps, preview changes, and download the cleaned dataset.")
+
     file = st.file_uploader("Upload CSV file", type=["csv"], help="CSV only. For large files, previews are sampled.")
-
-    if file:
-        try:
-            df = pd.read_csv(file)
-            st.session_state.raw_df = df.copy()
-            st.session_state.df = df.copy()
-            st.session_state.history = []
-            st.session_state.pipeline = []
-            st.session_state.changelog = ["📥 Loaded dataset."]
-            st.success(f"Loaded dataset with shape {df.shape}.")
-            with st.expander("Peek at data", expanded=True):
-                st.dataframe(sample_for_preview(df))
-        except Exception as e:
-            st.error(f"Failed to read CSV: {e}")
-    else:
+    if not file:
         st.info("Please upload a CSV file to get started.")
+        return
 
+    # Size validation
+    size_bytes = getattr(file, "size", None)
+    if size_bytes is not None:
+        size_mb = size_bytes / (1024 * 1024)
+        if size_mb > S("dps_settings")["max_upload_mb"]:
+            st.error(f"File is {size_mb:.1f} MB, which exceeds limit ({S('dps_settings')['max_upload_mb']} MB). Increase the limit in Settings or upload a smaller file.")
+            return
+
+    # Controls for sample/full load
+    load_mode = st.radio("Load mode", ["Full file", "Sample first N rows"], horizontal=True)
+    sample_n = int(st.number_input("N rows to sample (for initial load only)", min_value=10, max_value=5_000_000, value=10000, step=5000, help="Useful for very large files."))
+    try:
+        file.seek(0)
+        if load_mode == "Sample first N rows":
+            df = pd.read_csv(file, nrows=sample_n, low_memory=False)
+        else:
+            df = pd.read_csv(file, low_memory=False)
+        # ensure DataFrame is valid
+        if df is None or not isinstance(df, pd.DataFrame):
+            st.error("Uploaded file could not be parsed as a DataFrame.")
+            return
+        setS("dps_raw_df", df.copy())
+        setS("dps_df", df.copy())
+        setS("dps_history", [])
+        setS("dps_pipeline", [])
+        setS("dps_changelog", ["📥 Loaded dataset."])
+        update_preview_sample()
+        st.success(f"Loaded dataset with shape {df.shape}.")
+        with st.expander("Peek at data", expanded=True):
+            preview = S("dps_preview_df") if S("dps_preview_df") is not None else df.head(100)
+            st.dataframe(preview)
+    except Exception as e:
+        st.error(f"Failed to read CSV: {e}")
 
 def section_missing_data():
     st.header("1) Handling Missing Data")
-    df = st.session_state.df
+    df = S("dps_df")
     if df is None:
         st.warning("Upload a dataset first.")
         return
-    num_cols, cat_cols = dtype_split(df)
+
     cols = st.multiselect(
         "Columns to target (optional; default = all)",
         df.columns.tolist(),
-        help="Choose specific columns, or leave empty to apply to all.",
+        help="Choose specific columns, or leave empty to apply to all columns.",
     )
+
     with st.expander("Impute options"):
         strategy = st.selectbox("Imputation strategy", ["mean", "median", "mode", "constant"])
         const_val = None
         if strategy == "constant":
-            const_val = st.text_input("Constant value (interpreted as string if not numeric)", "0")
-            # Try to parse numeric
-            try:
-                if "." in const_val:
-                    const_val = float(const_val)
-                else:
-                    const_val = int(const_val)
-            except Exception:
-                pass
-        col1, col2 = st.columns(2)
-        with col1:
+            const_val = st.text_input("Constant value", "0", help="Will try to parse as number; if not, keeps as string.")
+        c1, c2 = st.columns(2)
+        with c1:
             if st.button("🔍 Preview Imputation"):
-                preview_df, msg = impute_missing(sample_for_preview(df), cols, strategy, const_val)
-                st.session_state.last_preview = (preview_df, msg)
+                preview_src = S("dps_preview_df") or S("dps_df")
+                preview_df, msg = impute_missing(preview_src, cols, strategy, const_val)
+                setS("dps_last_preview", (preview_df, msg))
                 st.info(msg)
                 st.dataframe(preview_df)
-        with col2:
+        with c2:
             if st.button("📦 Add to Pipeline (Impute)"):
                 step = {"kind": "impute", "params": {"columns": cols, "strategy": strategy, "constant_value": const_val}}
-                st.session_state.pipeline.append(step)
+                S("dps_pipeline").append(step)
                 st.success("Added to pipeline.")
+
     with st.expander("Drop options"):
         axis = st.radio("Drop axis", ["rows", "columns"], horizontal=True)
         threshold = st.slider("Missingness threshold (ratio)", 0.0, 1.0, 0.5, 0.05, help="Drop rows/cols with missing ratio ≥ threshold.")
         subset = []
+        help_txt = "Rows mode: drop rows with missing ratio ≥ threshold OR drop rows missing any of the selected columns."
         if axis == "rows":
-            subset = st.multiselect("For rows: require non-missing in selected columns (optional)", df.columns.tolist(), help="If selected, rows missing any of these will be dropped.")
-        col3, col4 = st.columns(2)
-        with col3:
+            subset = st.multiselect("Drop rows if these columns are missing (optional)", df.columns.tolist(), help=help_txt)
+        c3, c4 = st.columns(2)
+        with c3:
             if st.button("🔍 Preview Drop"):
-                prev = sample_for_preview(df)
-                preview_df, msg = drop_missing(prev, axis=axis, threshold=threshold, columns=subset if subset else None)
-                st.session_state.last_preview = (preview_df, msg)
+                preview_src = S("dps_preview_df") or S("dps_df")
+                preview_df, msg = drop_missing(preview_src, axis=axis, threshold=threshold, columns=subset if subset else None)
+                setS("dps_last_preview", (preview_df, msg))
                 st.info(msg)
                 st.dataframe(preview_df)
-        with col4:
+        with c4:
             if st.button("📦 Add to Pipeline (Drop Missing)"):
-                step = {
-                    "kind": "drop_missing",
-                    "params": {"axis": axis, "threshold": threshold, "columns": subset if subset else None},
-                }
-                st.session_state.pipeline.append(step)
+                step = {"kind": "drop_missing", "params": {"axis": axis, "threshold": threshold, "columns": subset if subset else None}}
+                S("dps_pipeline").append(step)
                 st.success("Added to pipeline.")
-
 
 def section_inconsistency():
     st.header("2) Data Inconsistency")
-    df = st.session_state.df
+    df = S("dps_df")
     if df is None:
         st.warning("Upload a dataset first.")
         return
-
     num_cols, cat_cols = dtype_split(df)
+
     st.subheader("Text Normalization")
     text_cols = st.multiselect("Text columns", [c for c in df.columns if c in cat_cols])
     c1, c2, c3 = st.columns(3)
@@ -617,18 +776,15 @@ def section_inconsistency():
     cc1, cc2 = st.columns(2)
     with cc1:
         if st.button("🔍 Preview Text Normalization"):
-            prev = sample_for_preview(df)
-            preview_df, msg = normalize_text(prev, text_cols, lower, trim, collapse)
-            st.session_state.last_preview = (preview_df, msg)
+            preview_src = S("dps_preview_df") or S("dps_df")
+            preview_df, msg = normalize_text(preview_src, text_cols, lower, trim, collapse)
+            setS("dps_last_preview", (preview_df, msg))
             st.info(msg)
             st.dataframe(preview_df)
     with cc2:
         if st.button("📦 Add to Pipeline (Normalize Text)"):
-            step = {
-                "kind": "normalize_text",
-                "params": {"columns": text_cols, "lowercase": lower, "trim": trim, "collapse_spaces": collapse},
-            }
-            st.session_state.pipeline.append(step)
+            step = {"kind": "normalize_text", "params": {"columns": text_cols, "lowercase": lower, "trim": trim, "collapse_spaces": collapse}}
+            S("dps_pipeline").append(step)
             st.success("Added to pipeline.")
 
     st.subheader("Date Standardization")
@@ -637,35 +793,35 @@ def section_inconsistency():
     dc1, dc2 = st.columns(2)
     with dc1:
         if st.button("🔍 Preview Date Standardization"):
-            prev = sample_for_preview(df)
-            preview_df, msg = standardize_dates(prev, date_cols, fmt)
-            st.session_state.last_preview = (preview_df, msg)
+            preview_src = S("dps_preview_df") or S("dps_df")
+            preview_df, msg = standardize_dates(preview_src, date_cols, fmt)
+            setS("dps_last_preview", (preview_df, msg))
             st.info(msg)
             st.dataframe(preview_df)
     with dc2:
         if st.button("📦 Add to Pipeline (Standardize Dates)"):
             step = {"kind": "standardize_dates", "params": {"columns": date_cols, "output_format": fmt}}
-            st.session_state.pipeline.append(step)
+            S("dps_pipeline").append(step)
             st.success("Added to pipeline.")
 
     st.subheader("Unit Conversion")
     uc_col = st.selectbox("Column to convert", ["(none)"] + df.columns.tolist())
     colA, colB, colC = st.columns(3)
     with colA:
-        factor = st.number_input("Multiply by factor", value=1.0, step=0.1, help="e.g., inches→cm = 2.54")
+        factor = float(st.number_input("Multiply by factor", value=1.0, step=0.1, format="%.6f", help="e.g., inches→cm = 2.54"))
     with colB:
         new_name = st.text_input("New column name (optional)", "", help="Leave blank to overwrite same column")
     with colC:
-        st.caption("Tip: Use this to create normalized units.")
+        st.caption("Tip: This creates normalized units while preserving NA.")
     uc1, uc2 = st.columns(2)
     with uc1:
         if st.button("🔍 Preview Unit Conversion"):
-            prev = sample_for_preview(df)
             if uc_col != "(none)":
-                preview_df, msg = unit_convert(prev, uc_col, factor, new_name or None)
+                preview_src = S("dps_preview_df") or S("dps_df")
+                preview_df, msg = unit_convert(preview_src, uc_col, factor, new_name or None)
             else:
-                preview_df, msg = prev, "No column selected."
-            st.session_state.last_preview = (preview_df, msg)
+                preview_df, msg = S("dps_preview_df") or S("dps_df"), "No column selected."
+            setS("dps_last_preview", (preview_df, msg))
             st.info(msg)
             st.dataframe(preview_df)
     with uc2:
@@ -673,17 +829,13 @@ def section_inconsistency():
             if uc_col == "(none)":
                 st.warning("Please select a column.")
             else:
-                step = {
-                    "kind": "unit_convert",
-                    "params": {"column": uc_col, "factor": factor, "new_name": new_name or None},
-                }
-                st.session_state.pipeline.append(step)
+                step = {"kind": "unit_convert", "params": {"column": uc_col, "factor": factor, "new_name": new_name or None}}
+                S("dps_pipeline").append(step)
                 st.success("Added to pipeline.")
-
 
 def section_outliers():
     st.header("3 & 7) Outliers / Noisy Data")
-    df = st.session_state.df
+    df = S("dps_df")
     if df is None:
         st.warning("Upload a dataset first.")
         return
@@ -693,56 +845,52 @@ def section_outliers():
     with col1:
         detect_method = st.selectbox("Detection method", ["IQR", "Z-score"])
     with col2:
-        zt = st.slider("Z-score threshold", 1.5, 5.0, 3.0, 0.1)
+        zt = float(st.slider("Z-score threshold", 1.5, 5.0, 3.0, 0.1))
     with col3:
-        ik = st.slider("IQR k (fence multiplier)", 0.5, 5.0, 1.5, 0.1)
+        ik = float(st.slider("IQR k (fence multiplier)", 0.5, 5.0, 1.5, 0.1))
 
     act = st.selectbox("Action on outliers", ["remove", "cap", "log1p"], help="Cap uses detection thresholds; log1p is a transform.")
     c1, c2 = st.columns(2)
     with c1:
         if st.button("🔍 Preview Outlier Handling"):
-            prev = sample_for_preview(df)
-            preview_df, msg = handle_outliers(prev, cols, act, detect_method, z_thresh=zt, iqr_k=ik)
-            st.session_state.last_preview = (preview_df, msg)
+            preview_src = S("dps_preview_df") or S("dps_df")
+            preview_df, msg = handle_outliers(preview_src, cols, act, detect_method, z_thresh=zt, iqr_k=ik)
+            setS("dps_last_preview", (preview_df, msg))
             st.info(msg)
             st.dataframe(preview_df)
     with c2:
         if st.button("📦 Add to Pipeline (Outliers)"):
-            step = {
-                "kind": "outliers",
-                "params": {"columns": cols, "method": act, "detect_method": detect_method, "z_thresh": zt, "iqr_k": ik},
-            }
-            st.session_state.pipeline.append(step)
+            step = {"kind": "outliers", "params": {"columns": cols, "method": act, "detect_method": detect_method, "z_thresh": zt, "iqr_k": ik}}
+            S("dps_pipeline").append(step)
             st.success("Added to pipeline.")
-
 
 def section_duplicates():
     st.header("4) Data Duplication")
-    df = st.session_state.df
+    df = S("dps_df")
     if df is None:
         st.warning("Upload a dataset first.")
         return
-    subset = st.multiselect("Columns to consider duplicates on (leave empty for all columns)", df.columns.tolist())
-    keep = st.selectbox("Keep", ["first", "last", "False"], help="If 'False', drop all duplicates.")
-    karg = False if keep == "False" else keep
+    subset = st.multiselect("Columns to consider (leave empty for all columns)", df.columns.tolist(),
+                            help="Duplicates are determined on the selected subset. Empty = all columns.")
+    keep_choice = st.radio("Duplicate handling", ["Keep first", "Keep last", "Drop all duplicates"], horizontal=True)
+    keep = {"Keep first": "first", "Keep last": "last", "Drop all duplicates": False}[keep_choice]
     c1, c2 = st.columns(2)
     with c1:
         if st.button("🔍 Preview Duplicate Removal"):
-            prev = sample_for_preview(df)
-            preview_df, msg = remove_duplicates(prev, subset if subset else None, keep=karg)
-            st.session_state.last_preview = (preview_df, msg)
+            preview_src = S("dps_preview_df") or S("dps_df")
+            preview_df, msg = remove_duplicates(preview_src, subset if subset else None, keep=keep)
+            setS("dps_last_preview", (preview_df, msg))
             st.info(msg)
             st.dataframe(preview_df)
     with c2:
         if st.button("📦 Add to Pipeline (Duplicates)"):
-            step = {"kind": "duplicates", "params": {"subset": subset if subset else None, "keep": karg}}
-            st.session_state.pipeline.append(step)
+            step = {"kind": "duplicates", "params": {"subset": subset if subset else None, "keep": keep}}
+            S("dps_pipeline").append(step)
             st.success("Added to pipeline.")
-
 
 def section_encoding():
     st.header("5) Categorical Data Handling")
-    df = st.session_state.df
+    df = S("dps_df")
     if df is None:
         st.warning("Upload a dataset first.")
         return
@@ -752,21 +900,20 @@ def section_encoding():
     c1, c2 = st.columns(2)
     with c1:
         if st.button("🔍 Preview Encoding"):
-            prev = sample_for_preview(df)
-            preview_df, msg = encode_categorical(prev, cols, method)
-            st.session_state.last_preview = (preview_df, msg)
+            preview_src = S("dps_preview_df") or S("dps_df")
+            preview_df, msg = encode_categorical(preview_src, cols, method)
+            setS("dps_last_preview", (preview_df, msg))
             st.info(msg)
             st.dataframe(preview_df)
     with c2:
         if st.button("📦 Add to Pipeline (Encoding)"):
             step = {"kind": "encode", "params": {"columns": cols, "method": method}}
-            st.session_state.pipeline.append(step)
+            S("dps_pipeline").append(step)
             st.success("Added to pipeline.")
-
 
 def section_scaling():
     st.header("6) Feature Scaling & Normalization")
-    df = st.session_state.df
+    df = S("dps_df")
     if df is None:
         st.warning("Upload a dataset first.")
         return
@@ -776,36 +923,35 @@ def section_scaling():
     c1, c2 = st.columns(2)
     with c1:
         if st.button("🔍 Preview Scaling"):
-            prev = sample_for_preview(df)
-            preview_df, msg = scale_features(prev, cols, method)
-            st.session_state.last_preview = (preview_df, msg)
+            preview_src = S("dps_preview_df") or S("dps_df")
+            preview_df, msg = scale_features(preview_src, cols, method)
+            setS("dps_last_preview", (preview_df, msg))
             st.info(msg)
             st.dataframe(preview_df)
     with c2:
         if st.button("📦 Add to Pipeline (Scaling)"):
             step = {"kind": "scale", "params": {"columns": cols, "method": method}}
-            st.session_state.pipeline.append(step)
+            S("dps_pipeline").append(step)
             st.success("Added to pipeline.")
-
 
 def section_imbalanced():
     st.header("8) Imbalanced Data (Classification)")
-    df = st.session_state.df
+    df = S("dps_df")
     if df is None:
         st.warning("Upload a dataset first.")
         return
-    target = st.selectbox("Target column (classification)", ["(none)"] + st.session_state.df.columns.tolist())
+    target = st.selectbox("Target column (classification)", ["(none)"] + df.columns.tolist())
     method = st.radio("Method", ["oversample", "undersample"], horizontal=True)
-    ratio = st.slider("Ratio", 0.2, 3.0, 1.0, 0.1, help="Oversample to ratio×majority; Undersample to ratio×minority.")
+    ratio = float(st.slider("Ratio", 0.2, 3.0, 1.0, 0.1, help="Oversample to ratio×majority; Undersample to ratio×minority."))
     c1, c2 = st.columns(2)
     with c1:
         if st.button("🔍 Preview Rebalancing"):
-            prev = sample_for_preview(df)
+            preview_src = S("dps_preview_df") or S("dps_df")
             if target != "(none)":
-                preview_df, msg = rebalance_dataset(prev, target, method, ratio)
+                preview_df, msg = rebalance_dataset(preview_src, target, method, ratio)
             else:
-                preview_df, msg = prev, "No target chosen."
-            st.session_state.last_preview = (preview_df, msg)
+                preview_df, msg = preview_src, "No target chosen."
+            setS("dps_last_preview", (preview_df, msg))
             st.info(msg)
             st.dataframe(preview_df)
     with c2:
@@ -813,84 +959,120 @@ def section_imbalanced():
             if target == "(none)":
                 st.warning("Please select a target column.")
             else:
-                step = {
-                    "kind": "rebalance",
-                    "params": {"target": target, "method": method, "ratio": ratio},
-                }
-                st.session_state.pipeline.append(step)
+                step = {"kind": "rebalance", "params": {"target": target, "method": method, "ratio": ratio}}
+                S("dps_pipeline").append(step)
                 st.success("Added to pipeline.")
-
 
 def section_pipeline_preview():
     st.header("9) Pipeline & Preview")
-    df = st.session_state.df
-    if df is None:
+    df = S("dps_df")
+    raw = S("dps_raw_df")
+    if df is None or raw is None:
         st.warning("Upload a dataset first.")
         return
 
     st.subheader("Queued Steps")
-    if not st.session_state.pipeline:
+    if not S("dps_pipeline"):
         st.info("Pipeline is empty. Add steps from the sections on the left.")
     else:
-        for i, step in enumerate(st.session_state.pipeline, start=1):
+        for i, step in enumerate(S("dps_pipeline"), start=1):
             st.write(f"{i}. **{step['kind']}** — {step.get('params', {})}")
 
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
         if st.button("🧪 Preview Full Pipeline (on sample)"):
-            prev = sample_for_preview(df)
-            preview_df, msgs = run_pipeline(prev, st.session_state.pipeline)
-            st.session_state.last_preview = (preview_df, "\n".join(msgs))
-            st.success("Pipeline preview complete.")
+            # Always preview on a sample from the RAW dataset
+            rs = int(S("dps_settings")["random_state"])
+            n = int(S("dps_settings")["preview_rows"])
+            if len(raw) > n:
+                sample_df = raw.sample(n=n, random_state=rs).copy()
+            else:
+                sample_df = raw.copy()
+
+            preview_df, msgs, err = run_pipeline(
+                sample_df,
+                S("dps_pipeline"),
+                atomic=S("dps_settings")["atomic_apply"],
+            )
+            setS("dps_last_preview", (preview_df, "\n".join(msgs) + (f"\nERROR: {err}" if err else "")))
+            if err:
+                st.error(err)
+            else:
+                st.success("Pipeline preview complete.")
     with col2:
         if st.button("🚮 Clear Pipeline"):
-            st.session_state.pipeline = []
+            setS("dps_pipeline", [])
             st.info("Cleared pipeline.")
     with col3:
         progress_placeholder = st.empty()
         if st.button("✅ Apply Pipeline to Data"):
-            if not st.session_state.pipeline:
+            if not S("dps_pipeline"):
                 st.warning("Pipeline is empty.")
             else:
+                # Push history before applying so user can undo
                 push_history("Before pipeline")
-                msgs = []
-                tmp_df = st.session_state.df.copy()
-                steps = st.session_state.pipeline.copy()
+                steps = S("dps_pipeline").copy()
                 total = len(steps)
+                msgs = []
+                atomic = S("dps_settings")["atomic_apply"]
+                t_all0 = time.perf_counter()
+                # Apply from RAW for determinism (as earlier design)
+                tmp_df = raw.copy()
+                error_msg = None
                 for i, step in enumerate(steps, start=1):
                     progress_placeholder.progress(i / total, text=f"Applying step {i}/{total}: {step['kind']}")
-                    tmp_df, msg = apply_step(tmp_df, step)
-                    msgs.append(msg)
-                    time.sleep(0.05)
+                    try:
+                        t0 = time.perf_counter()
+                        tmp_df, msg = apply_step(tmp_df, step)
+                        dt = time.perf_counter() - t0
+                        msgs.append(f"{i}. {msg} (took {dt:.3f}s)")
+                        if tmp_df is None:
+                            raise RuntimeError("Step returned None dataframe.")
+                    except Exception as e:
+                        error_msg = f"Step {i} '{step.get('kind')}' failed: {e}"
+                        msgs.append(f"❌ {error_msg}")
+                        if atomic:
+                            # rollback to previous dps_df (the one before apply)
+                            prev_df = S("dps_df")
+                            tmp_df = prev_df.copy() if prev_df is not None else None
+                            break
+                        # else continue
                 progress_placeholder.empty()
-                st.session_state.df = tmp_df
-                st.session_state.changelog.extend([f"✅ {m}" for m in msgs])
-                st.success("Applied pipeline to full dataset.")
-                st.session_state.pipeline = []  # clear
+                dt_all = time.perf_counter() - t_all0
+                setS("dps_df", tmp_df)
+                update_preview_sample()
+                for m in msgs:
+                    S("dps_changelog").append(f"✅ {m}" if not m.startswith("❌") else m)
+                if error_msg:
+                    st.error(error_msg + (" — Rolled back changes." if atomic else " — Applied partial changes."))
+                else:
+                    st.success(f"Applied pipeline to full dataset in {dt_all:.3f}s.")
+                setS("dps_pipeline", [])  # always clear after apply
 
     st.markdown("---")
-    if st.session_state.last_preview is not None:
-        prev_df, msg = st.session_state.last_preview
+    if S("dps_last_preview") is not None:
+        prev_df, msg = S("dps_last_preview")
         st.subheader("Latest Preview Result")
         with st.expander("Preview Summary", expanded=True):
             st.code(msg or "", language="text")
-        st.dataframe(prev_df)
+        if prev_df is None:
+            st.info("Preview produced no data.")
+        else:
+            st.dataframe(prev_df)
 
-        # Optional distribution comparison for a selected numeric column
-        num_cols, _ = dtype_split(prev_df)
-        if num_cols:
-            column = st.selectbox("Preview histogram for column", num_cols)
-            left, right = st.columns(2)
-            with left:
-                st.altair_chart(alt_histogram(sample_for_preview(st.session_state.df), column, "Current Data"), use_container_width=True)
-            with right:
-                st.altair_chart(alt_histogram(prev_df, column, "Preview Data"), use_container_width=True)
-
+            num_cols, _ = dtype_split(prev_df)
+            if num_cols:
+                column = st.selectbox("Preview histogram for column", num_cols)
+                left, right = st.columns(2)
+                with left:
+                    safe_alt_histogram(S("dps_df"), column, "Current Data")
+                with right:
+                    safe_alt_histogram(prev_df, column, "Preview Data")
 
 def section_dashboard_download():
     st.header("📊 Dashboard & Download")
-    df = st.session_state.df
-    raw = st.session_state.raw_df
+    df = S("dps_df")
+    raw = S("dps_raw_df")
     if df is None or raw is None:
         st.warning("Upload a dataset first.")
         return
@@ -911,7 +1093,11 @@ def section_dashboard_download():
 
         st.subheader("Missing by Column (After)")
         miss_after = pd.Series(after_stats["missing_by_col"])
-        st.dataframe(miss_after[miss_after > 0].rename("missing_count"))
+        miss_after = miss_after[miss_after > 0] if not miss_after.empty else miss_after
+        if miss_after.empty:
+            st.info("No missing values in the current dataset.")
+        else:
+            st.dataframe(miss_after.rename("missing_count"))
 
         with st.expander("Dtypes (After)"):
             st.json(after_stats["dtypes"])
@@ -931,37 +1117,39 @@ def section_dashboard_download():
             a, b = st.columns(2)
             with a:
                 st.subheader("Before")
-                st.altair_chart(alt_histogram(sample_for_preview(raw), col, f"Before: {col}"), use_container_width=True)
+                safe_alt_histogram(raw, col, f"Before: {col}")
             with b:
                 st.subheader("After")
-                st.altair_chart(alt_histogram(sample_for_preview(df), col, f"After: {col}"), use_container_width=True)
+                safe_alt_histogram(df, col, f"After: {col}")
 
     with t3:
-        if not st.session_state.changelog:
+        if not S("dps_changelog"):
             st.info("No changes yet.")
         else:
-            for i, msg in enumerate(st.session_state.changelog, start=1):
+            for i, msg in enumerate(S("dps_changelog"), start=1):
                 st.write(f"{i}. {msg}")
 
     st.markdown("---")
     st.subheader("Download Processed Data")
-    buf = io.StringIO()
-    df.to_csv(buf, index=False)
-    st.download_button(
-        "💾 Download CSV",
-        data=buf.getvalue(),
-        file_name="preprocessed_data.csv",
-        mime="text/csv",
-        help="Download the final processed dataset as a CSV file.",
-    )
-    st.caption("All processing happens in your browser session. Nothing is uploaded to external servers by this app code.")
-
+    if df is None or df.empty:
+        st.warning("Current dataset is empty; nothing to download.")
+    else:
+        buf = io.StringIO()
+        df.to_csv(buf, index=False)
+        st.download_button(
+            "💾 Download CSV",
+            data=buf.getvalue(),
+            file_name="preprocessed_data.csv",
+            mime="text/csv",
+            help="Download the final processed dataset as a CSV file.",
+        )
+    st.caption("All processing happens within your session. Large-file previews use sampling for stability.")
 
 # =========================
 # Main App Entrypoint
 # =========================
 def main():
-    section = sidebar_navigation()
+    section = sidebar_navigation_and_settings()
 
     if section == "Upload":
         section_upload()
@@ -987,10 +1175,8 @@ def main():
     # Footer
     st.markdown("---")
     st.caption(
-        "Pro tip: Add multiple steps to the pipeline and apply them in one go. "
-        "Use the Dashboard to understand how your dataset changed."
+        "Pro tip: Use the ⚙️ Settings in the sidebar to control preview size, upload limits, randomness and atomic apply."
     )
-
 
 if __name__ == "__main__":
     main()
