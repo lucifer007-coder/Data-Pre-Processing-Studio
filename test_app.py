@@ -1,12 +1,6 @@
 # test_app.py
-# Streamlit Data Preprocessing Studio — Revised & Hardened
-# Description:
-# A complete Streamlit application to upload CSVs and perform data preprocessing tasks
-# with a pipeline-based UI, robust validation, better error handling, and improved UX.
+# Streamlit Data Preprocessing Studio — Final Hardened Version
 
-# =========================
-# Imports
-# =========================
 import io
 import os
 import time
@@ -29,35 +23,34 @@ st.set_page_config(
 )
 
 # =========================
-# Constants & Defaults (configurable via sidebar)
+# Constants & Defaults
 # =========================
 DEFAULT_RANDOM_STATE = 42
 DEFAULT_PREVIEW_ROWS = int(os.getenv("DPS_PREVIEW_ROWS", "500"))
 DEFAULT_MAX_UPLOAD_MB = int(os.getenv("DPS_MAX_UPLOAD_MB", "200"))
 
 # =========================
-# Session State Bootstrap (namespaced to avoid conflicts)
+# Session State
 # =========================
 def init_session():
     ss = st.session_state
-    ss.setdefault("dps_raw_df", None)          # original loaded DataFrame
-    ss.setdefault("dps_df", None)              # current working DataFrame
-    ss.setdefault("dps_history", [])           # list[(label, df_snapshot)]
-    ss.setdefault("dps_pipeline", [])          # list of step dicts
-    ss.setdefault("dps_changelog", [])         # user-readable messages
-    ss.setdefault("dps_last_preview", None)    # cache preview (df, msg)
-    ss.setdefault("dps_preview_df", None)      # sampled preview of current df
+    ss.setdefault("dps_raw_df", None)
+    ss.setdefault("dps_df", None)
+    ss.setdefault("dps_history", [])
+    ss.setdefault("dps_pipeline", [])
+    ss.setdefault("dps_changelog", [])
+    ss.setdefault("dps_last_preview", None)
+    ss.setdefault("dps_preview_df", None)
     ss.setdefault("dps_settings", {
         "preview_rows": DEFAULT_PREVIEW_ROWS,
         "max_upload_mb": DEFAULT_MAX_UPLOAD_MB,
         "random_state": DEFAULT_RANDOM_STATE,
-        "atomic_apply": True,                  # rollback on first error
-        "low_memory_mode": True,               # show sampled previews only
+        "atomic_apply": True,
+        "low_memory_mode": True,
     })
 
 init_session()
 
-# Convenience accessors
 def S(key: str):
     return st.session_state[key]
 
@@ -68,21 +61,21 @@ def setS(key: str, value):
 # Utility Helpers
 # =========================
 def update_preview_sample():
-    """Update preview sample whenever dps_df changes."""
     df = S("dps_df")
     if df is None or df.empty:
         setS("dps_preview_df", df)
         return
     n = S("dps_settings")["preview_rows"]
     rs = S("dps_settings")["random_state"]
-    if len(df) <= n:
-        setS("dps_preview_df", df.copy())
-    else:
-        setS("dps_preview_df", df.sample(n=n, random_state=rs).copy())
+    setS("dps_preview_df", df.sample(n=min(len(df), n), random_state=rs).copy())
 
 def push_history(label: str):
     if S("dps_df") is not None:
-        S("dps_history").append((label, S("dps_df").copy()))
+        hist = S("dps_history")
+        hist.append((label, S("dps_df").copy()))
+        # Fix: avoid memory blowup, keep only last 10 snapshots
+        if len(hist) > 10:
+            hist.pop(0)
 
 def undo_last():
     if S("dps_history"):
@@ -270,43 +263,33 @@ def normalize_text(
     msg = f"Normalized text for columns: {applied}. Skipped: {skipped}."
     return df, msg
 
-def standardize_dates(
-    df: pd.DataFrame, columns: List[str], output_format: str = "%Y-%m-%d"
-) -> Tuple[pd.DataFrame, str]:
+def standardize_dates(df: pd.DataFrame, columns: List[str], output_format: str = "%Y-%m-%d"):
     df = df.copy()
     report = []
     for c in columns:
         if c not in df.columns:
             report.append(f"{c}: not found")
             continue
-        parsed = pd.to_datetime(df[c], errors="coerce", infer_datetime_format=True)
-        n = len(df)
-        failed = int(parsed.isna().sum())
-        success = n - failed
-        # keep NA if unparseable
+        parsed = pd.to_datetime(df[c], errors="coerce")  # Fix: removed deprecated arg
+        n, failed = len(df), int(parsed.isna().sum())
         df[c] = parsed.dt.strftime(output_format)
-        report.append(f"{c}: parsed {success}/{n}, failed {failed}")
-    msg = f"Standardized dates ({output_format}). Details: " + "; ".join(report)
-    return df, msg
+        report.append(f"{c}: parsed {n - failed}/{n}, failed {failed}")
+    return df, "Standardized dates. " + "; ".join(report)
 
-def unit_convert(
-    df: pd.DataFrame, column: Optional[str] = None, factor: float = 1.0, new_name: Optional[str] = None
-) -> Tuple[pd.DataFrame, str]:
+def unit_convert(df: pd.DataFrame, column: Optional[str] = None, factor: float = 1.0, new_name: Optional[str] = None):
     df = df.copy()
-    if column is None or column not in df.columns:
+    if not column or column not in df.columns:
         return df, f"Column '{column}' not found for unit conversion."
-    # try numeric coercion to handle numeric-looking strings safely
     numeric = pd.to_numeric(df[column], errors="coerce")
     finite_mask = np.isfinite(numeric)
-    created = new_name if new_name else column
     out = df[column].copy()
-    out.loc[finite_mask] = (numeric.loc[finite_mask] * factor).astype(numeric.dtype)
+    out.loc[finite_mask] = (numeric.loc[finite_mask] * factor).astype(float)  # Fix: force float
     if new_name:
         df[new_name] = out
-        msg = f"Created '{new_name}' from '{column}' using factor {factor}. Non-finite values left unchanged: {(~finite_mask).sum()}."
+        msg = f"Created '{new_name}' from '{column}' (factor={factor}). Non-finite left: {(~finite_mask).sum()}."
     else:
         df[column] = out
-        msg = f"Converted '{column}' in place using factor {factor}. Non-finite values left unchanged: {(~finite_mask).sum()}."
+        msg = f"Converted '{column}' in place (factor={factor}). Non-finite left: {(~finite_mask).sum()}."
     return df, msg
 
 # 3 & 7) Outliers / Noisy Data
@@ -404,42 +387,73 @@ def encode_categorical(df: pd.DataFrame, columns: List[str], method: str = "oneh
     cols = [c for c in columns if c in df.columns]
     if not cols:
         return df, "No valid columns selected for encoding."
+
     if method == "onehot":
         before_cols = set(df.columns)
         df = pd.get_dummies(df, columns=cols, drop_first=False, dummy_na=False)
         added = list(set(df.columns) - before_cols)
         msg = f"One-hot encoded {len(cols)} columns. Added {len(added)} new columns."
-    else:  # 'label' using factorize to preserve NaN
+    else:  # 'label'
         applied = []
         for c in cols:
-            codes, uniques = pd.factorize(df[c], sort=True, na_sentinel=-1)
+            # ✅ Pandas 2.x compatible
+            codes, uniques = pd.factorize(df[c], sort=True, use_na_sentinel=True)
             s = pd.Series(codes, index=df.index)
-            s = s.mask(s == -1)  # keep NaN as <NA>
-            df[c] = s.astype("Int64")
+            # -1 means NaN when use_na_sentinel=True
+            s = s.mask(s == -1)  
+            df[c] = s.astype("Int64")  # nullable integer dtype
             applied.append(c)
         msg = f"Label-encoded columns (nullable Int64): {applied}."
     return df, msg
 
 # 6) Scaling / Normalization
-def scale_features(df: pd.DataFrame, columns: List[str], method: str = "standard") -> Tuple[pd.DataFrame, str]:
+def scale_features(df: pd.DataFrame, columns: List[str], method: str = "standard"):
+    if df.empty:
+        return df.copy(), "Dataset is empty; nothing scaled."  # Fix: safe empty handling
     df = df.copy()
     cols = [c for c in columns if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
     if not cols:
         return df, "No numeric columns selected for scaling."
     scaler = StandardScaler() if method == "standard" else MinMaxScaler()
-    df[cols] = scaler.fit_transform(df[cols].values)
-    msg = f"Applied {'StandardScaler' if method == 'standard' else 'MinMaxScaler'} to columns: {cols}."
-    return df, msg
+    df[cols] = scaler.fit_transform(df[cols])  # Fix: no .values, keeps col alignment
+    return df, f"Applied {scaler.__class__.__name__} to: {cols}."
 
 # 8) Imbalanced Data (basic random over/under sampling)
 def rebalance_dataset(
-    df: pd.DataFrame, target: str, method: str = "oversample", ratio: float = 1.0, random_state: Optional[int] = None
+    df: pd.DataFrame,
+    target: str,
+    method: str = "oversample",
+    ratio: float = 1.0,
+    random_state: Optional[int] = None
 ) -> Tuple[pd.DataFrame, str]:
+    """
+    Basic oversampling / undersampling for imbalanced classification datasets.
+
+    Parameters:
+        df : DataFrame
+            The dataset.
+        target : str
+            The target column for classification.
+        method : str
+            "oversample" or "undersample".
+        ratio : float
+            Oversample to ratio × majority count, or undersample to ratio × minority count.
+        random_state : int, optional
+            Random seed for reproducibility.
+
+    Returns:
+        (DataFrame, str)
+            Rebalanced DataFrame and a descriptive message.
+    """
     if target not in df.columns:
         return df, f"Target column '{target}' not found."
+    if df.empty:
+        return df.copy(), "Dataset is empty; skipping rebalancing."
+
     df = df.copy()
     rs = S("dps_settings")["random_state"] if random_state is None else random_state
     counts = df[target].value_counts(dropna=False)
+
     if counts.empty or len(counts) <= 1:
         return df, "Target column has only one class or is empty; skipping rebalancing."
 
@@ -457,6 +471,7 @@ def rebalance_dataset(
                 dfs.append(subset)
         df_bal = pd.concat(dfs, axis=0).sample(frac=1.0, random_state=rs).reset_index(drop=True)
         msg = f"Oversampled minority classes to ~{desired} rows each (ratio={ratio})."
+
     else:  # undersample
         minority_count = counts.min()
         desired = max(1, int(round(minority_count * ratio)))
@@ -469,6 +484,7 @@ def rebalance_dataset(
                 dfs.append(subset)
         df_bal = pd.concat(dfs, axis=0).sample(frac=1.0, random_state=rs).reset_index(drop=True)
         msg = f"Undersampled majority classes to ~{desired} rows each (ratio={ratio})."
+
     if df_bal.empty:
         msg += " Resulting dataset is empty."
     return df_bal, msg
@@ -508,28 +524,18 @@ def apply_step(df: pd.DataFrame, step: Dict[str, Any]) -> Tuple[pd.DataFrame, st
         return rebalance_dataset(df, **params)
     return df, f"Unknown step kind: {kind}"
 
-def run_pipeline(df: pd.DataFrame, pipeline: List[Dict[str, Any]], atomic: bool = True) -> Tuple[pd.DataFrame, List[str], Optional[str]]:
-    """
-    Apply pipeline steps in order.
-    - atomic=True: rollback to original df on first error.
-    Returns: (new_df, messages, error_message_if_any)
-    """
-    msgs = []
-    working = df.copy()
+def run_pipeline(df, pipeline, atomic=True):
+    msgs, working = [], df.copy()
     for idx, step in enumerate(pipeline, start=1):
         try:
             t0 = time.perf_counter()
             working, msg = apply_step(working, step)
-            dt = time.perf_counter() - t0
-            msgs.append(f"{idx}. {msg} (took {dt:.3f}s)")
-            if working is None:
-                raise RuntimeError("Step returned None dataframe.")
+            msgs.append(f"{idx}. {msg} (took {time.perf_counter() - t0:.3f}s)")
         except Exception as e:
             err = f"Step {idx} '{step.get('kind')}' failed: {e}"
             if atomic:
                 return df, msgs, err
-            else:
-                msgs.append(f"❌ {err} — continuing (non-atomic).")
+            msgs.append(f"❌ {err} — continuing.")
     return working, msgs, None
 
 # =========================
@@ -868,7 +874,8 @@ def section_imbalanced():
 def section_pipeline_preview():
     st.header("9) Pipeline & Preview")
     df = S("dps_df")
-    if df is None:
+    raw = S("dps_raw_df")
+    if df is None or raw is None:
         st.warning("Upload a dataset first.")
         return
 
@@ -882,7 +889,19 @@ def section_pipeline_preview():
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
         if st.button("🧪 Preview Full Pipeline (on sample)"):
-            preview_df, msgs, err = run_pipeline(S("dps_preview_df"), S("dps_pipeline"), atomic=True)
+            # Always preview on a sample from the RAW dataset
+            rs = S("dps_settings")["random_state"]
+            n = S("dps_settings")["preview_rows"]
+            if len(raw) > n:
+                sample_df = raw.sample(n=n, random_state=rs).copy()
+            else:
+                sample_df = raw.copy()
+
+            preview_df, msgs, err = run_pipeline(
+                sample_df,
+                S("dps_pipeline"),
+                atomic=S("dps_settings")["atomic_apply"],
+            )
             setS("dps_last_preview", (preview_df, "\n".join(msgs) + (f"\nERROR: {err}" if err else "")))
             if err:
                 st.error(err)
@@ -904,7 +923,8 @@ def section_pipeline_preview():
                 msgs = []
                 atomic = S("dps_settings")["atomic_apply"]
                 t_all0 = time.perf_counter()
-                tmp_df = S("dps_df").copy()
+                # ✅ Always apply from the RAW dataset for determinism
+                tmp_df = raw.copy()
                 error_msg = None
                 for i, step in enumerate(steps, start=1):
                     progress_placeholder.progress(i / total, text=f"Applying step {i}/{total}: {step['kind']}")
@@ -919,7 +939,7 @@ def section_pipeline_preview():
                         error_msg = f"Step {i} '{step.get('kind')}' failed: {e}"
                         msgs.append(f"❌ {error_msg}")
                         if atomic:
-                            tmp_df = S("dps_df").copy()  # rollback
+                            tmp_df = df.copy()  # rollback to last stable dataset
                             break
                         # else continue
                 progress_placeholder.empty()
@@ -932,7 +952,7 @@ def section_pipeline_preview():
                     st.error(error_msg + (" — Rolled back changes." if atomic else " — Applied partial changes."))
                 else:
                     st.success(f"Applied pipeline to full dataset in {dt_all:.3f}s.")
-                setS("dps_pipeline", [])  # always clear to prevent inconsistent state
+                setS("dps_pipeline", [])  # always clear after apply
 
     st.markdown("---")
     if S("dps_last_preview") is not None:
