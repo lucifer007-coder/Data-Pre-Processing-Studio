@@ -152,7 +152,3 @@ You can try the app here:
 
 * Inspired by real-world challenges in **data preprocessing**
 * Built with ❤️ using **Streamlit**
-
----
-
-Would you like me to also create a **`requirements.txt` file** alongside this README so that users can install everything with one command?
